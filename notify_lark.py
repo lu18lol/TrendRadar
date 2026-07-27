@@ -1,11 +1,18 @@
-"""Read TrendRadar HTML report and push to Feishu via Lark API."""
+"""Bridge: TrendRadar generic_webhook → collect → reformat → Lark API push.
+
+Two modes:
+  --collect : HTTP server that saves TrendRadar batches to a temp file, returns 200 immediately
+  --send    : Read temp file, reformat content, send to Feishu via Lark API
+"""
 import os, sys, json, re
 import urllib.request
-from html.parser import HTMLParser
+import tempfile
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 APP_ID = os.environ["LARK_APP_ID"]
 APP_SECRET = os.environ["LARK_APP_SECRET"]
 CHAT_ID = os.environ["LARK_CHAT_ID"]
+BATCH_FILE = tempfile.gettempdir() + "/tr_batches.json"
 
 def get_token():
     url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
@@ -13,26 +20,59 @@ def get_token():
     req = urllib.request.Request(url, data, {"Content-Type": "application/json"})
     return json.loads(urllib.request.urlopen(req).read())["tenant_access_token"]
 
-def send_lark(text):
-    token = get_token()
-    # Split long messages into chunks (Feishu text limit ~30KB)
-    chunks = []
-    current = ""
-    for line in text.split('\n'):
-        if len(current) + len(line) + 1 > 25000:
-            chunks.append(current)
-            current = line
-        else:
-            current = current + '\n' + line if current else line
-    if current:
-        chunks.append(current)
+def preserve_links(text):
+    """Convert markdown links to readable format: [text](url) → text (url)"""
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1\n  \2', text)
+    # Remove bold markers but keep content
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    return text
 
-    for i, chunk in enumerate(chunks):
+class CollectHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length)) if length else {}
+        try:
+            batches = []
+            if os.path.exists(BATCH_FILE):
+                batches = json.loads(open(BATCH_FILE).read())
+        except:
+            batches = []
+        batches.append(body)
+        with open(BATCH_FILE, 'w') as f:
+            json.dump(batches, f, ensure_ascii=False)
+        print(f"[collect] batch {len(batches)}: {body.get('title','')[:50]}")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"{}")
+    def log_message(self, fmt, *args):
+        pass
+
+def run_collect(port=18900):
+    HTTPServer(("127.0.0.1", port), CollectHandler).serve_forever()
+
+def run_send():
+    if not os.path.exists(BATCH_FILE):
+        print("No batches to send")
+        return
+
+    batches = json.loads(open(BATCH_FILE).read())
+    token = get_token()
+
+    for i, batch in enumerate(batches):
+        title = batch.get("title", "")
+        content = batch.get("content", "")
+        text = preserve_links(content) if content else preserve_links(title)
+
+        # Truncate per-batch if needed
+        if len(text) > 25000:
+            text = text[:25000] + "\n...(截断)"
+
         url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
         body = json.dumps({
             "receive_id": CHAT_ID,
             "msg_type": "text",
-            "content": json.dumps({"text": chunk}),
+            "content": json.dumps({"text": text}),
         }).encode()
         req = urllib.request.Request(url, body, {
             "Content-Type": "application/json",
@@ -40,83 +80,19 @@ def send_lark(text):
         })
         resp = json.loads(urllib.request.urlopen(req).read())
         if resp.get("code") != 0:
-            print(f"Lark API error: {resp}", file=sys.stderr)
+            print(f"[send] batch {i+1} FAILED: {resp}", file=sys.stderr)
         else:
-            print(f"  Chunk {i+1}/{len(chunks)} sent: {resp['data']['message_id']}")
+            print(f"[send] batch {i+1}/{len(batches)} OK: {resp['data']['message_id']}")
 
-def extract_report(html_path):
-    """Extract plain text content from TrendRadar HTML report"""
-    with open(html_path, 'r', encoding='utf-8') as f:
-        html = f.read()
-
-    class TextExtractor(HTMLParser):
-        def __init__(self):
-            super().__init__()
-            self.lines = []
-            self.skip = False
-            self.in_style = False
-            self.in_script = False
-            self.in_head = False
-            self.current = ""
-
-        def handle_starttag(self, tag, attrs):
-            if tag in ('style', 'script'):
-                self.in_style = True
-            if tag in ('br', 'hr', 'li', 'tr', 'h1', 'h2', 'h3', 'h4', 'div', 'p'):
-                if self.current.strip():
-                    self.lines.append(self.current.strip())
-                    self.current = ""
-
-        def handle_endtag(self, tag):
-            if tag in ('style', 'script'):
-                self.in_style = False
-            if tag in ('br', 'p', 'div', 'li', 'tr', 'h1', 'h2', 'h3', 'h4', 'hr'):
-                if self.current.strip():
-                    self.lines.append(self.current.strip())
-                    self.current = ""
-
-        def handle_data(self, data):
-            if self.in_style or self.in_script:
-                return
-            text = data.strip()
-            if text:
-                self.current += " " + text if self.current else text
-
-    extractor = TextExtractor()
-    extractor.feed(html)
-    if extractor.current.strip():
-        extractor.lines.append(extractor.current.strip())
-
-    # Deduplicate and filter empty/irrelevant lines
-    seen = set()
-    clean = []
-    for line in extractor.lines:
-        if line and line not in seen and len(line) > 2:
-            # Skip css/js noise
-            if line.startswith('.') or line.startswith('{') or line.startswith('}'):
-                continue
-            if line.startswith('function') or line.startswith('var ') or line.startswith('const '):
-                continue
-            seen.add(line)
-            clean.append(line)
-
-    return '\n'.join(clean[:200])  # cap at 200 lines
-
-
-def main():
-    html_path = "output/html/latest/current.html"
-    if not os.path.exists(html_path):
-        print(f"No HTML report at {html_path}", file=sys.stderr)
-        sys.exit(0)
-
-    text = extract_report(html_path)
-    if len(text) < 50:
-        print(f"Report too short ({len(text)} chars), may be empty", file=sys.stderr)
-        sys.exit(0)
-
-    print(f"Extracted {len(text)} chars from report")
-    send_lark(text)
-
+    # Clean up
+    os.unlink(BATCH_FILE)
 
 if __name__ == "__main__":
-    main()
+    if "--collect" in sys.argv:
+        port = int(sys.argv[sys.argv.index("--collect")+1]) if "--collect" in sys.argv and len(sys.argv) > sys.argv.index("--collect")+1 else 18900
+        run_collect(port)
+    elif "--send" in sys.argv:
+        run_send()
+    else:
+        print("Usage: notify_lark.py --collect [port] | --send", file=sys.stderr)
+        sys.exit(1)
