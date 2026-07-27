@@ -167,7 +167,37 @@ jobs:
           S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
           S3_REGION: ${{ secrets.S3_REGION }}
           GITHUB_ACTIONS: true
-        run: uv run python -m trendradar
+        run: uv run python -m trendradar 2>&1 | tee /tmp/tr-output.txt
+
+      - name: Notify Feishu via Lark API
+        if: success()
+        env:
+          LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
+          LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
+          LARK_CHAT_ID: ${{ secrets.LARK_CHAT_ID }}
+        run: |
+          # Extract summary from TrendRadar output
+          SUMMARY=$(grep -E '准备发送|匹配|抓取完成|AI.*分析完成|新增热点' /tmp/tr-output.txt | tail -20 | sed 's/^/  /')
+          COUNT=$(grep -oP '合计 \d+ 条' /tmp/tr-output.txt | tail -1 || echo "N/A")
+
+          NOW=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')
+          REPO_URL="https://github.com/${{ github.repository }}"
+
+          CARD=$(cat <<INNER
+          {
+            "header": {
+              "title": {"tag": "plain_text", "content": "TrendRadar 热点推送"},
+              "template": "blue"
+            },
+            "elements": [
+              {"tag": "markdown", "content": "**时间：** $NOW\\n**推送：** $COUNT\\n\\n$SUMMARY"},
+              {"tag": "hr"},
+              {"tag": "action", "actions": [{"tag": "button", "text": {"tag": "plain_text", "content": "查看完整报告"}, "url": "$REPO_URL", "type": "default"}]}
+            ]
+          }
+          INNER
+          )
+          python3 notify_lark.py "$CARD"
 
       # --------------------------------------------------------------------------------
       # ☁️ CLOUDFLARE PAGES DEPLOY / 部署到 Cloudflare Pages（可选）

@@ -298,8 +298,8 @@ notification:
       webhook_url: ""                 # Slack Incoming Webhook URL
 
     generic_webhook:
-      webhook_url: "http://127.0.0.1:8898/"  # 桥接 → 飞书群
-      payload_template: '{"title":"{title}","content":"{content}"}'
+      webhook_url: ""                 # 通用 Webhook URL（支持 Discord、Matrix、IFTTT 等）
+      payload_template: ""
                                       # 示例：{"content": "{content}"}
                                       # 留空则使用默认格式：{"title": "{title}", "content": "{content}"}
 
