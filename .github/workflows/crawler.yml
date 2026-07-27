@@ -175,12 +175,9 @@ jobs:
           LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
           LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
           LARK_CHAT_ID: ${{ secrets.LARK_CHAT_ID }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          COUNT=$(grep -oP '合计 \d+ 条' /tmp/tr-output.txt | tail -1 || echo "0条")
-          PLATFORM_COUNT=$(grep -oP '成功: \[' /tmp/tr-output.txt | wc -l | tr -d ' ')
-          NOW=$(TZ=Asia/Shanghai date '+%m-%d %H:%M')
-          MSG="TrendRadar 热点推送 | ${NOW} | ${COUNT} | 仓库: ${{ github.server_url }}/${{ github.repository }}"
-          python3 notify_lark.py "$MSG"
+          python3 notify_lark.py < /tmp/tr-output.txt
 
       # --------------------------------------------------------------------------------
       # ☁️ CLOUDFLARE PAGES DEPLOY / 部署到 Cloudflare Pages（可选）
