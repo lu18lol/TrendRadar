@@ -133,7 +133,7 @@ jobs:
             exit 1
           fi
 
-      - name: Run crawler
+      - name: Start Lark bridge & run crawler
         if: success()
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
@@ -152,9 +152,9 @@ jobs:
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           BARK_URL: ${{ secrets.BARK_URL }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          # 通用Webhook配置
-          GENERIC_WEBHOOK_URL: ${{ secrets.GENERIC_WEBHOOK_URL }}
-          GENERIC_WEBHOOK_TEMPLATE: ${{ secrets.GENERIC_WEBHOOK_TEMPLATE }}
+          # 通用Webhook → 本地桥接
+          GENERIC_WEBHOOK_URL: http://127.0.0.1:18900
+          GENERIC_WEBHOOK_TEMPLATE: '{"title":"{title}","content":"{content}"}'
           # AI 配置（ai_analysis 和 ai_translation 共享模型配置）
           AI_ANALYSIS_ENABLED: ${{ secrets.AI_ANALYSIS_ENABLED }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
@@ -167,17 +167,22 @@ jobs:
           S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
           S3_REGION: ${{ secrets.S3_REGION }}
           GITHUB_ACTIONS: true
-        run: uv run python -m trendradar 2>&1 | tee /tmp/tr-output.txt
-
-      - name: Notify Feishu via Lark API
-        if: success()
-        env:
-          LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
-          LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
-          LARK_CHAT_ID: ${{ secrets.LARK_CHAT_ID }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          python3 notify_lark.py < /tmp/tr-output.txt
+          # Start Lark bridge server (receives TrendRadar's generic_webhook → forwards to Feishu)
+          LARK_APP_ID="${{ secrets.LARK_APP_ID }}" \
+          LARK_APP_SECRET="${{ secrets.LARK_APP_SECRET }}" \
+          LARK_CHAT_ID="${{ secrets.LARK_CHAT_ID }}" \
+          python3 notify_lark.py --server 18900 &
+          BRIDGE_PID=$!
+          sleep 2
+
+          # Run TrendRadar (will POST batches to the bridge at localhost:18900)
+          uv run python -m trendradar 2>&1 | tee /tmp/tr-output.txt
+
+          # Wait for bridge to finish processing pending messages, then stop
+          sleep 5
+          kill $BRIDGE_PID 2>/dev/null || true
+          echo "Bridge stopped."
 
       # --------------------------------------------------------------------------------
       # ☁️ CLOUDFLARE PAGES DEPLOY / 部署到 Cloudflare Pages（可选）

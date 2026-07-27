@@ -1,19 +1,32 @@
-"""Extract TrendRadar news from SQLite + console output, send to Feishu via Lark API."""
-import os, sys, json, re, sqlite3, glob
+"""Bridge: receive TrendRadar generic_webhook, forward to Feishu via Lark API.
+
+Two modes:
+  --server : run as HTTP server, TrendRadar POSTs to it, forward each batch to Lark
+  default  : stdin mode, send raw text to Lark (fallback)
+"""
+import os, sys, json, re
 import urllib.request
-from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 APP_ID = os.environ["LARK_APP_ID"]
 APP_SECRET = os.environ["LARK_APP_SECRET"]
 CHAT_ID = os.environ["LARK_CHAT_ID"]
 
+_token = None
+
 def get_token():
+    global _token
+    if _token:
+        return _token
     url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
     data = json.dumps({"app_id": APP_ID, "app_secret": APP_SECRET}).encode()
     req = urllib.request.Request(url, data, {"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req).read())["tenant_access_token"]
+    _token = json.loads(urllib.request.urlopen(req).read())["tenant_access_token"]
+    return _token
 
-def send_msg(token, text):
+def send_lark(text):
+    token = get_token()
     url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
     body = json.dumps({
         "receive_id": CHAT_ID,
@@ -27,130 +40,59 @@ def send_msg(token, text):
     resp = json.loads(urllib.request.urlopen(req).read())
     if resp.get("code") != 0:
         print(f"Lark API error: {resp}", file=sys.stderr)
-        sys.exit(1)
-    print(f"Message sent: {resp['data']['message_id']}")
+        return False
+    print(f"  -> Lark sent: {resp['data']['message_id']}")
+    return True
 
-def load_keywords():
-    """Load frequency words from config"""
-    words = []
-    try:
-        with open("config/frequency_words.txt") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    words.append(line)
-    except FileNotFoundError:
-        pass
-    return words
+def strip_markdown(text):
+    """Remove markdown formatting characters for plain text display."""
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    return text
 
-def get_latest_news():
-    """Get latest news from SQLite, filtered by keywords"""
-    db_files = sorted(glob.glob("output/news/*.db"), reverse=True)
-    if not db_files:
-        return None
+class BridgeHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length)) if length else {}
+        title = body.get("title", "")
+        content = body.get("content", "")
 
-    keywords = load_keywords()
+        # TrendRadar sends markdown content; strip tags for plain text Lark
+        clean_title = strip_markdown(title)
+        clean_content = strip_markdown(content)
+        msg = clean_content if clean_content else f"{clean_title}\n\n{clean_content}"
+        if not msg.strip():
+            msg = clean_title
 
-    conn = sqlite3.connect(db_files[0])
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+        # Truncate if needed
+        if len(msg) > 28000:
+            msg = msg[:28000] + "\n...[截断]"
 
-    # Get the latest crawl time
-    cur.execute("SELECT MAX(last_crawl_time) as t FROM news_items")
-    row = cur.fetchone()
-    if not row or not row["t"]:
-        conn.close()
-        return None
-    latest = row["t"]
+        print(f"Batch: {len(msg)} chars | {clean_title[:50] if clean_title else '-'}")
+        ok = send_lark(msg)
+        self.send_response(200 if ok else 500)
+        self.end_headers()
+        self.wfile.write(b"{}")
 
-    # Get news from the latest crawl, join with platform name, filter by keywords
-    cur.execute("""
-        SELECT n.title, p.name as platform, n.rank, n.url
-        FROM news_items n
-        JOIN platforms p ON n.platform_id = p.id
-        WHERE n.last_crawl_time = ?
-        ORDER BY n.rank ASC
-    """, (latest,))
+    def log_message(self, format, *args):
+        print(f"[bridge] {args[0]}")
 
-    all_news = cur.fetchall()
-    conn.close()
 
-    if not all_news:
-        return None
+def run_server(port=18900):
+    server = HTTPServer(("127.0.0.1", port), BridgeHandler)
+    print(f"Bridge listening on 127.0.0.1:{port}")
+    server.serve_forever()
 
-    # Filter by keyword
-    if keywords:
-        matched = []
-        for item in all_news:
-            title = item["title"].lower()
-            for kw in keywords:
-                if kw.lower() in title:
-                    matched.append(dict(item))
-                    break
-    else:
-        matched = [dict(item) for item in all_news]
-
-    return {
-        "total": len(all_news),
-        "matched": matched[:30],  # cap at 30 headlines
-        "platforms": list(set(item["platform"] for item in all_news)),
-    }
-
-def format_news(news_items):
-    """Format news items into text lines"""
-    lines = []
-    seen = set()
-    for item in news_items:
-        title = item["title"]
-        platform = item["platform"]
-        # Deduplicate by title
-        if title in seen:
-            continue
-        seen.add(title)
-        # Truncate long titles
-        if len(title) > 50:
-            title = title[:48] + ".."
-        lines.append(f"· [{platform}] {title}")
-    return lines
-
-def main():
-    news = get_latest_news()
-
-    # Also parse console output for stats
-    console = sys.stdin.read()
-    info = {}
-    for line in console.split('\n'):
-        m = re.search(r'当前榜单.*?(\d+) 条.*?频率词匹配', line)
-        if m: info['hotlist_match'] = m.group(1)
-        m = re.search(r'新增热点过滤后：(\d+) 条', line)
-        if m: info['new_count'] = m.group(1)
-
-    now = datetime.now().strftime('%m-%d %H:%M')
-
-    parts = [f"🔥 TrendRadar 热点推送 | {now}\n"]
-
-    if news:
-        stats = f"共抓取 {news['total']} 条，命中 {len(news['matched'])} 条，覆盖 {len(news['platforms'])} 个平台\n"
-        parts.append(stats)
-
-        headlines = format_news(news['matched'])
-        if headlines:
-            parts.append("—" * 20)
-            parts.extend(headlines)
-    elif info:
-        parts.append(f"热榜命中：{info.get('hotlist_match', '?')} 条")
-
-    repo = os.environ.get('GITHUB_REPOSITORY', 'lu18lol/TrendRadar')
-    parts.append(f"\n完整报告：https://github.com/{repo}")
-
-    msg = '\n'.join(parts)
-    # Feishu text limit is ~30KB, truncate if needed
-    if len(msg) > 28000:
-        msg = msg[:28000] + "\n...（内容过长已截断）"
-
-    print(f"Sending {len(msg)} chars...")
-    token = get_token()
-    send_msg(token, msg)
 
 if __name__ == "__main__":
-    main()
+    if "--server" in sys.argv:
+        port = int(sys.argv[2]) if len(sys.argv) > 2 else 18900
+        run_server(port)
+    else:
+        # Fallback: read from stdin
+        text = sys.stdin.read().strip()
+        if text:
+            send_lark(text)
+        else:
+            print("No input", file=sys.stderr)
