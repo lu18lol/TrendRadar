@@ -1,98 +1,122 @@
-"""Bridge: receive TrendRadar generic_webhook, forward to Feishu via Lark API.
-
-Two modes:
-  --server : run as HTTP server, TrendRadar POSTs to it, forward each batch to Lark
-  default  : stdin mode, send raw text to Lark (fallback)
-"""
+"""Read TrendRadar HTML report and push to Feishu via Lark API."""
 import os, sys, json, re
 import urllib.request
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
+from html.parser import HTMLParser
 
 APP_ID = os.environ["LARK_APP_ID"]
 APP_SECRET = os.environ["LARK_APP_SECRET"]
 CHAT_ID = os.environ["LARK_CHAT_ID"]
 
-_token = None
-
 def get_token():
-    global _token
-    if _token:
-        return _token
     url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
     data = json.dumps({"app_id": APP_ID, "app_secret": APP_SECRET}).encode()
     req = urllib.request.Request(url, data, {"Content-Type": "application/json"})
-    _token = json.loads(urllib.request.urlopen(req).read())["tenant_access_token"]
-    return _token
+    return json.loads(urllib.request.urlopen(req).read())["tenant_access_token"]
 
 def send_lark(text):
     token = get_token()
-    url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
-    body = json.dumps({
-        "receive_id": CHAT_ID,
-        "msg_type": "text",
-        "content": json.dumps({"text": text}),
-    }).encode()
-    req = urllib.request.Request(url, body, {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    })
-    resp = json.loads(urllib.request.urlopen(req).read())
-    if resp.get("code") != 0:
-        print(f"Lark API error: {resp}", file=sys.stderr)
-        return False
-    print(f"  -> Lark sent: {resp['data']['message_id']}")
-    return True
+    # Split long messages into chunks (Feishu text limit ~30KB)
+    chunks = []
+    current = ""
+    for line in text.split('\n'):
+        if len(current) + len(line) + 1 > 25000:
+            chunks.append(current)
+            current = line
+        else:
+            current = current + '\n' + line if current else line
+    if current:
+        chunks.append(current)
 
-def strip_markdown(text):
-    """Remove markdown formatting characters for plain text display."""
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-    text = re.sub(r'<[^>]+>', '', text)
-    return text
+    for i, chunk in enumerate(chunks):
+        url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+        body = json.dumps({
+            "receive_id": CHAT_ID,
+            "msg_type": "text",
+            "content": json.dumps({"text": chunk}),
+        }).encode()
+        req = urllib.request.Request(url, body, {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        })
+        resp = json.loads(urllib.request.urlopen(req).read())
+        if resp.get("code") != 0:
+            print(f"Lark API error: {resp}", file=sys.stderr)
+        else:
+            print(f"  Chunk {i+1}/{len(chunks)} sent: {resp['data']['message_id']}")
 
-class BridgeHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length)) if length else {}
-        title = body.get("title", "")
-        content = body.get("content", "")
+def extract_report(html_path):
+    """Extract plain text content from TrendRadar HTML report"""
+    with open(html_path, 'r', encoding='utf-8') as f:
+        html = f.read()
 
-        # TrendRadar sends markdown content; strip tags for plain text Lark
-        clean_title = strip_markdown(title)
-        clean_content = strip_markdown(content)
-        msg = clean_content if clean_content else f"{clean_title}\n\n{clean_content}"
-        if not msg.strip():
-            msg = clean_title
+    class TextExtractor(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.lines = []
+            self.skip = False
+            self.in_style = False
+            self.in_script = False
+            self.in_head = False
+            self.current = ""
 
-        # Truncate if needed
-        if len(msg) > 28000:
-            msg = msg[:28000] + "\n...[截断]"
+        def handle_starttag(self, tag, attrs):
+            if tag in ('style', 'script'):
+                self.in_style = True
+            if tag in ('br', 'hr', 'li', 'tr', 'h1', 'h2', 'h3', 'h4', 'div', 'p'):
+                if self.current.strip():
+                    self.lines.append(self.current.strip())
+                    self.current = ""
 
-        print(f"Batch: {len(msg)} chars | {clean_title[:50] if clean_title else '-'}")
-        ok = send_lark(msg)
-        self.send_response(200 if ok else 500)
-        self.end_headers()
-        self.wfile.write(b"{}")
+        def handle_endtag(self, tag):
+            if tag in ('style', 'script'):
+                self.in_style = False
+            if tag in ('br', 'p', 'div', 'li', 'tr', 'h1', 'h2', 'h3', 'h4', 'hr'):
+                if self.current.strip():
+                    self.lines.append(self.current.strip())
+                    self.current = ""
 
-    def log_message(self, format, *args):
-        print(f"[bridge] {args[0]}")
+        def handle_data(self, data):
+            if self.in_style or self.in_script:
+                return
+            text = data.strip()
+            if text:
+                self.current += " " + text if self.current else text
+
+    extractor = TextExtractor()
+    extractor.feed(html)
+    if extractor.current.strip():
+        extractor.lines.append(extractor.current.strip())
+
+    # Deduplicate and filter empty/irrelevant lines
+    seen = set()
+    clean = []
+    for line in extractor.lines:
+        if line and line not in seen and len(line) > 2:
+            # Skip css/js noise
+            if line.startswith('.') or line.startswith('{') or line.startswith('}'):
+                continue
+            if line.startswith('function') or line.startswith('var ') or line.startswith('const '):
+                continue
+            seen.add(line)
+            clean.append(line)
+
+    return '\n'.join(clean[:200])  # cap at 200 lines
 
 
-def run_server(port=18900):
-    server = HTTPServer(("127.0.0.1", port), BridgeHandler)
-    print(f"Bridge listening on 127.0.0.1:{port}")
-    server.serve_forever()
+def main():
+    html_path = "output/html/latest/current.html"
+    if not os.path.exists(html_path):
+        print(f"No HTML report at {html_path}", file=sys.stderr)
+        sys.exit(0)
+
+    text = extract_report(html_path)
+    if len(text) < 50:
+        print(f"Report too short ({len(text)} chars), may be empty", file=sys.stderr)
+        sys.exit(0)
+
+    print(f"Extracted {len(text)} chars from report")
+    send_lark(text)
 
 
 if __name__ == "__main__":
-    if "--server" in sys.argv:
-        port = int(sys.argv[2]) if len(sys.argv) > 2 else 18900
-        run_server(port)
-    else:
-        # Fallback: read from stdin
-        text = sys.stdin.read().strip()
-        if text:
-            send_lark(text)
-        else:
-            print("No input", file=sys.stderr)
+    main()
