@@ -9,14 +9,13 @@ import urllib.request
 import tempfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-APP_ID = os.environ["LARK_APP_ID"]
-APP_SECRET = os.environ["LARK_APP_SECRET"]
-CHAT_ID = os.environ["LARK_CHAT_ID"]
 BATCH_FILE = tempfile.gettempdir() + "/tr_batches.json"
 
 def get_token():
+    app_id = os.environ["LARK_APP_ID"]
+    app_secret = os.environ["LARK_APP_SECRET"]
     url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-    data = json.dumps({"app_id": APP_ID, "app_secret": APP_SECRET}).encode()
+    data = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
     req = urllib.request.Request(url, data, {"Content-Type": "application/json"})
     return json.loads(urllib.request.urlopen(req).read())["tenant_access_token"]
 
@@ -56,6 +55,7 @@ def run_send():
         print("No batches to send")
         return
 
+    chat_id = os.environ["LARK_CHAT_ID"]
     batches = json.loads(open(BATCH_FILE).read())
     token = get_token()
 
@@ -70,7 +70,7 @@ def run_send():
 
         url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
         body = json.dumps({
-            "receive_id": CHAT_ID,
+            "receive_id": chat_id,
             "msg_type": "text",
             "content": json.dumps({"text": text}),
         }).encode()
