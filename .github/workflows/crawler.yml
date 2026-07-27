@@ -176,28 +176,11 @@ jobs:
           LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
           LARK_CHAT_ID: ${{ secrets.LARK_CHAT_ID }}
         run: |
-          # Extract summary from TrendRadar output
-          SUMMARY=$(grep -E '准备发送|匹配|抓取完成|AI.*分析完成|新增热点' /tmp/tr-output.txt | tail -20 | sed 's/^/  /')
-          COUNT=$(grep -oP '合计 \d+ 条' /tmp/tr-output.txt | tail -1 || echo "N/A")
-
-          NOW=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')
-          REPO_URL="https://github.com/${{ github.repository }}"
-
-          CARD=$(cat <<INNER
-          {
-            "header": {
-              "title": {"tag": "plain_text", "content": "TrendRadar 热点推送"},
-              "template": "blue"
-            },
-            "elements": [
-              {"tag": "markdown", "content": "**时间：** $NOW\\n**推送：** $COUNT\\n\\n$SUMMARY"},
-              {"tag": "hr"},
-              {"tag": "action", "actions": [{"tag": "button", "text": {"tag": "plain_text", "content": "查看完整报告"}, "url": "$REPO_URL", "type": "default"}]}
-            ]
-          }
-          INNER
-          )
-          python3 notify_lark.py "$CARD"
+          COUNT=$(grep -oP '合计 \d+ 条' /tmp/tr-output.txt | tail -1 || echo "0条")
+          PLATFORM_COUNT=$(grep -oP '成功: \[' /tmp/tr-output.txt | wc -l | tr -d ' ')
+          NOW=$(TZ=Asia/Shanghai date '+%m-%d %H:%M')
+          MSG="TrendRadar 热点推送 | ${NOW} | ${COUNT} | 仓库: ${{ github.server_url }}/${{ github.repository }}"
+          python3 notify_lark.py "$MSG"
 
       # --------------------------------------------------------------------------------
       # ☁️ CLOUDFLARE PAGES DEPLOY / 部署到 Cloudflare Pages（可选）

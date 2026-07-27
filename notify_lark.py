@@ -17,8 +17,8 @@ def send_message(token, content):
     url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
     body = json.dumps({
         "receive_id": CHAT_ID,
-        "msg_type": "interactive",
-        "content": content,
+        "msg_type": "text",
+        "content": json.dumps({"text": content}),
     }).encode()
     req = urllib.request.Request(url, body, {
         "Content-Type": "application/json",
